@@ -1,98 +1,95 @@
-name: Temp Speechify Download
+name: Temp Speechify Capture
 on:
   pull_request:
   workflow_dispatch:
 
 jobs:
-  fetch-audio:
+  capture:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Capture Speechify audio with browser
+      - name: Install browser audio capture deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pulseaudio ffmpeg xvfb
+          python3 -m pip install --quiet selenium
+      - name: Capture actual Speechify playback
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf speechify_bridge_out && mkdir -p speechify_bridge_out
-          python3 -m pip install --quiet selenium requests
-          python3 - <<'PY'
-          import json, pathlib, time, base64, requests, re
+          rm -rf speechify_capture && mkdir speechify_capture
+          pulseaudio --start || true
+          pactl load-module module-null-sink sink_name=SpeechSink sink_properties=device.description=SpeechSink || true
+          pactl set-default-sink SpeechSink
+          pactl set-default-source SpeechSink.monitor
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x960x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+          cat > /tmp/capture.py <<'PY'
+          import subprocess, time, pathlib, os
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
           from selenium.webdriver.common.by import By
-          out=pathlib.Path('speechify_bridge_out')
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          out=pathlib.Path('speechify_capture')
           urls={
             'wife1':'https://app.speechify.com/soundbite/7f9e7eac6126477eae9ebc3257ab8fc5?utm_source=chatgpt_app&utm_medium=punchout',
             'husband1':'https://app.speechify.com/soundbite/9d14f4ce44d2488eb7d61dbbd072a653?utm_source=chatgpt_app&utm_medium=punchout',
             'wife2':'https://app.speechify.com/soundbite/43e4e808801c44c381163fdb1af31e2a?utm_source=chatgpt_app&utm_medium=punchout',
             'husband2':'https://app.speechify.com/soundbite/18ac239e4897431f8cb8709385aacf27?utm_source=chatgpt_app&utm_medium=punchout',
           }
-          opt=Options(); opt.add_argument('--headless=new'); opt.add_argument('--no-sandbox'); opt.add_argument('--disable-dev-shm-usage'); opt.add_argument('--autoplay-policy=no-user-gesture-required'); opt.set_capability('goog:loggingPrefs', {'performance':'ALL','browser':'ALL'})
+          opt=Options()
+          opt.add_argument('--no-sandbox')
+          opt.add_argument('--disable-dev-shm-usage')
+          opt.add_argument('--autoplay-policy=no-user-gesture-required')
+          opt.add_argument('--disable-gpu')
+          opt.add_argument('--window-size=1280,960')
+          opt.add_argument('--use-fake-ui-for-media-stream')
+          opt.add_argument('--alsa-output-device=default')
           driver=webdriver.Chrome(options=opt)
-          driver.execute_cdp_cmd('Network.enable', {})
-          allreport={}
+          wait=WebDriverWait(driver,25)
           for name,url in urls.items():
-              print('OPEN',name,url)
-              driver.get(url); time.sleep(6)
-              # try any audio element and likely play buttons
+              print('OPEN',name,url,flush=True)
+              driver.get(url)
+              time.sleep(7)
+              # Make sure volume is unmuted if compact player is already open.
               try:
-                  aud=driver.find_elements(By.TAG_NAME,'audio')
-                  print('audio tags',[(a.get_attribute('src'),a.get_attribute('currentSrc')) for a in aud])
-              except Exception: pass
-              buttons=driver.find_elements(By.TAG_NAME,'button')
-              print('buttons',len(buttons),[b.get_attribute('aria-label') or b.text for b in buttons[:30]])
-              for b in buttons[:30]:
-                  label=((b.get_attribute('aria-label') or '')+' '+(b.text or '')).lower()
-                  if any(k in label for k in ['play','listen','audio']) or not label.strip():
-                      try: driver.execute_script('arguments[0].click()',b); time.sleep(1.5)
-                      except Exception: pass
-              time.sleep(5)
-              logs=driver.get_log('performance')
-              net=[]; candidates=[]
-              for row in logs:
+                  vol=driver.find_element(By.CSS_SELECTOR,"[data-testid='compact-player-volume-button']")
+                  if (vol.get_attribute('aria-label') or '').lower()=='unmute':
+                      driver.execute_script('arguments[0].click()',vol)
+              except Exception as e: print('vol',e,flush=True)
+              raw=out/f'{name}-raw.wav'
+              ff=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','warning','-y','-f','pulse','-i','SpeechSink.monitor','-ac','2','-ar','48000','-t','9',str(raw)])
+              time.sleep(.4)
+              clicked=False
+              selectors=["[data-testid='compact-player-listen-button']","[data-testid='player-play-button']"]
+              for sel in selectors:
                   try:
-                      m=json.loads(row['message'])['message']
-                      if m['method']!='Network.responseReceived': continue
-                      p=m['params']; resp=p['response']; u=resp.get('url',''); mime=resp.get('mimeType','')
-                      item={'requestId':p.get('requestId'),'url':u,'mime':mime,'status':resp.get('status')}
-                      net.append(item)
-                      if mime.startswith('audio/') or any(k in u.lower() for k in ['.mp3','.m4a','.wav','.aac','audio','speech','soundbite']): candidates.append(item)
-                  except Exception: pass
-              (out/f'{name}-network.json').write_text(json.dumps(net,indent=2))
-              allreport[name]={'candidates':candidates,'title':driver.title,'url':driver.current_url}
-              print('CAND',candidates)
-              saved=False
-              for i,item in enumerate(candidates):
-                  rid=item['requestId']
-                  try:
-                      body=driver.execute_cdp_cmd('Network.getResponseBody',{'requestId':rid})
-                      raw=base64.b64decode(body['body']) if body.get('base64Encoded') else body['body'].encode()
-                      mime=item.get('mime','')
-                      if mime.startswith('audio/') or raw[:3]==b'ID3' or raw[:2] in [b'\xff\xfb',b'\xff\xf3',b'\xff\xf2']:
-                          ext='.m4a' if 'mp4' in mime else '.wav' if 'wav' in mime else '.mp3'
-                          (out/f'{name}{ext}').write_bytes(raw); saved=True; print('SAVED BODY',name,len(raw),item['url']); break
-                      # Save interesting json/text bodies for endpoint discovery
-                      if len(raw)<500000 and (mime in ['application/json','text/plain'] or 'json' in mime):
-                          (out/f'{name}-resp-{i}.txt').write_bytes(raw)
-                  except Exception as e: print('body err',e)
-              if not saved:
-                  # try direct candidate URL with browser cookies
-                  sess=requests.Session()
-                  for c in driver.get_cookies(): sess.cookies.set(c['name'],c['value'],domain=c.get('domain'))
-                  for item in candidates:
-                      try:
-                          rr=sess.get(item['url'],headers={'User-Agent':driver.execute_script('return navigator.userAgent'),'Referer':url},timeout=60)
-                          ct=(rr.headers.get('content-type') or '').lower(); print('REQ',rr.status_code,ct,len(rr.content),rr.url)
-                          if 'audio/' in ct or rr.content[:3]==b'ID3':
-                              ext='.m4a' if 'mp4' in ct else '.wav' if 'wav' in ct else '.mp3'
-                              (out/f'{name}{ext}').write_bytes(rr.content); saved=True; break
-                      except Exception as e: print('req err',e)
-              (out/f'{name}-page.html').write_text(driver.page_source)
+                      btn=wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,sel)))
+                      print('CLICK',sel,'label',btn.get_attribute('aria-label'),'text',btn.text,flush=True)
+                      driver.execute_script('arguments[0].click()',btn)
+                      clicked=True
+                      break
+                  except Exception as e: print('click fail',sel,e,flush=True)
+              if not clicked:
+                  raise RuntimeError(f'No listen/play button for {name}')
+              ff.wait(timeout=15)
+              # Trim leading/trailing silence, preserve a tiny natural boundary.
+              trimmed=out/f'{name}.wav'
+              subprocess.run(['ffmpeg','-hide_banner','-loglevel','warning','-y','-i',str(raw),'-af',
+                  'silenceremove=start_periods=1:start_silence=0.08:start_threshold=-46dB:stop_periods=-1:stop_silence=0.12:stop_threshold=-46dB',
+                  '-ar','48000','-ac','2',str(trimmed)],check=True)
+              subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(trimmed)],check=False)
           driver.quit()
-          (out/'browser-report.json').write_text(json.dumps(allreport,indent=2))
           PY
-          find speechify_bridge_out -maxdepth 1 -type f -printf '%f %s bytes\n'
+          python3 /tmp/capture.py
+          rm -f speechify_capture/*-raw.wav
+          ls -lh speechify_capture
+          for f in speechify_capture/*.wav; do echo ===$f===; ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f"; done
       - uses: actions/upload-artifact@v4
         with:
-          name: speechify-browser-audio
-          path: speechify_bridge_out/
+          name: speechify-captured-wav
+          path: speechify_capture/*.wav
           if-no-files-found: error
