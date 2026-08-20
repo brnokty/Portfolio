@@ -11,22 +11,27 @@ jobs:
       - name: Install browser audio capture deps
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y pulseaudio ffmpeg xvfb
+          sudo apt-get install -y pulseaudio pulseaudio-utils ffmpeg xvfb
           python3 -m pip install --quiet selenium
       - name: Capture actual Speechify playback
         shell: bash
         run: |
           set -euxo pipefail
           rm -rf speechify_capture && mkdir speechify_capture
-          pulseaudio --start || true
-          pactl load-module module-null-sink sink_name=SpeechSink sink_properties=device.description=SpeechSink || true
+          pulseaudio --kill || true
+          pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=file:/tmp/pulse.log
+          sleep 1
+          pactl info
+          pactl load-module module-null-sink sink_name=SpeechSink sink_properties=device.description=SpeechSink
           pactl set-default-sink SpeechSink
           pactl set-default-source SpeechSink.monitor
+          pactl list short sinks
+          pactl list short sources
           export DISPLAY=:99
           Xvfb :99 -screen 0 1280x960x24 >/tmp/xvfb.log 2>&1 &
           sleep 2
           cat > /tmp/capture.py <<'PY'
-          import subprocess, time, pathlib, os
+          import subprocess, time, pathlib
           from selenium import webdriver
           from selenium.webdriver.chrome.options import Options
           from selenium.webdriver.common.by import By
@@ -46,48 +51,45 @@ jobs:
           opt.add_argument('--autoplay-policy=no-user-gesture-required')
           opt.add_argument('--disable-gpu')
           opt.add_argument('--window-size=1280,960')
-          opt.add_argument('--use-fake-ui-for-media-stream')
-          opt.add_argument('--alsa-output-device=default')
           driver=webdriver.Chrome(options=opt)
-          wait=WebDriverWait(driver,25)
+          wait=WebDriverWait(driver,30)
           for name,url in urls.items():
               print('OPEN',name,url,flush=True)
               driver.get(url)
               time.sleep(7)
-              # Make sure volume is unmuted if compact player is already open.
-              try:
-                  vol=driver.find_element(By.CSS_SELECTOR,"[data-testid='compact-player-volume-button']")
-                  if (vol.get_attribute('aria-label') or '').lower()=='unmute':
-                      driver.execute_script('arguments[0].click()',vol)
-              except Exception as e: print('vol',e,flush=True)
               raw=out/f'{name}-raw.wav'
-              ff=subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','warning','-y','-f','pulse','-i','SpeechSink.monitor','-ac','2','-ar','48000','-t','9',str(raw)])
-              time.sleep(.4)
+              rec=subprocess.Popen(['parec','--device=SpeechSink.monitor','--file-format=wav','--rate=48000','--channels=2',str(raw)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+              time.sleep(.5)
               clicked=False
-              selectors=["[data-testid='compact-player-listen-button']","[data-testid='player-play-button']"]
-              for sel in selectors:
+              for sel in ["[data-testid='compact-player-listen-button']","[data-testid='player-play-button']"]:
                   try:
                       btn=wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,sel)))
-                      print('CLICK',sel,'label',btn.get_attribute('aria-label'),'text',btn.text,flush=True)
+                      print('CLICK',sel,'aria=',btn.get_attribute('aria-label'),'text=',btn.text,flush=True)
                       driver.execute_script('arguments[0].click()',btn)
                       clicked=True
                       break
-                  except Exception as e: print('click fail',sel,e,flush=True)
+                  except Exception as e:
+                      print('click fail',sel,e,flush=True)
               if not clicked:
-                  raise RuntimeError(f'No listen/play button for {name}')
-              ff.wait(timeout=15)
-              # Trim leading/trailing silence, preserve a tiny natural boundary.
+                  rec.terminate(); raise RuntimeError(f'No play control for {name}')
+              time.sleep(7)
+              rec.terminate()
+              try: rec.wait(timeout=5)
+              except: rec.kill()
+              if not raw.exists() or raw.stat().st_size < 1000:
+                  err=rec.stderr.read() if rec.stderr else ''
+                  raise RuntimeError(f'Capture failed for {name}; size={raw.stat().st_size if raw.exists() else 0}; {err}')
               trimmed=out/f'{name}.wav'
               subprocess.run(['ffmpeg','-hide_banner','-loglevel','warning','-y','-i',str(raw),'-af',
-                  'silenceremove=start_periods=1:start_silence=0.08:start_threshold=-46dB:stop_periods=-1:stop_silence=0.12:stop_threshold=-46dB',
-                  '-ar','48000','-ac','2',str(trimmed)],check=True)
-              subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(trimmed)],check=False)
+                'silenceremove=start_periods=1:start_silence=0.06:start_threshold=-50dB:stop_periods=-1:stop_silence=0.12:stop_threshold=-50dB,alimiter=limit=0.95',
+                '-ar','48000','-ac','2',str(trimmed)],check=True)
+              dur=subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(trimmed)],text=True).strip()
+              print('DONE',name,'duration',dur,'size',trimmed.stat().st_size,flush=True)
           driver.quit()
           PY
           python3 /tmp/capture.py
           rm -f speechify_capture/*-raw.wav
           ls -lh speechify_capture
-          for f in speechify_capture/*.wav; do echo ===$f===; ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$f"; done
       - uses: actions/upload-artifact@v4
         with:
           name: speechify-captured-wav
