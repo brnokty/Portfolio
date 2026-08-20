@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - '.github/workflows/tmp-speechify-download.yml'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -13,6 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Fetch Speechify soundbites
         shell: bash
         run: |
@@ -70,15 +73,6 @@ jobs:
           (out/'report.json').write_text(json.dumps(report,indent=2))
           PY
           find speechify_bridge_out -maxdepth 1 -type f -printf '%f %s bytes\n'
-      - name: Commit bridge results
-        shell: bash
-        run: |
-          git config user.name 'speechify-bridge-bot'
-          git config user.email 'actions@users.noreply.github.com'
-          git add speechify_bridge_out
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'Temporary Speechify bridge results [skip ci]'
-          git push
       - uses: actions/upload-artifact@v4
         with:
           name: speechify-audio
