@@ -1,80 +1,127 @@
-name: Temp Speechify Download
+name: Temp Speechify Capture
 on:
-  push:
-    paths:
-      - '.github/workflows/tmp-speechify-download.yml'
   pull_request:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  fetch-audio:
+  capture:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Fetch Speechify soundbites
+      - name: Install browser audio capture deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y pulseaudio pulseaudio-utils ffmpeg xvfb
+          python3 -m pip install --quiet selenium
+      - name: Capture Speechify playback
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf speechify_bridge_out
-          mkdir -p speechify_bridge_out
-          python3 - <<'PY'
-          import requests, re, json, pathlib, html
-          out=pathlib.Path('speechify_bridge_out')
-          urls = {
-            'wife1':'https://app.speechify.com/soundbite/7f9e7eac6126477eae9ebc3257ab8fc5?utm_source=chatgpt_app&utm_medium=punchout',
-            'husband1':'https://app.speechify.com/soundbite/9d14f4ce44d2488eb7d61dbbd072a653?utm_source=chatgpt_app&utm_medium=punchout',
-            'wife2':'https://app.speechify.com/soundbite/43e4e808801c44c381163fdb1af31e2a?utm_source=chatgpt_app&utm_medium=punchout',
-            'husband2':'https://app.speechify.com/soundbite/18ac239e4897431f8cb8709385aacf27?utm_source=chatgpt_app&utm_medium=punchout',
-          }
-          s=requests.Session()
-          s.headers.update({'User-Agent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131 Safari/537.36','Accept':'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'})
-          report=[]
-          for name,url in urls.items():
-              info={'name':name,'source':url,'tries':[]}
-              r=s.get(url,timeout=60,allow_redirects=True)
-              info['top']={'status':r.status_code,'url':r.url,'ctype':r.headers.get('content-type'),'length':len(r.content)}
-              ctype=(r.headers.get('content-type') or '').lower()
-              if 'audio/' in ctype:
-                  ext='.m4a' if 'mp4' in ctype else '.wav' if 'wav' in ctype else '.mp3'
-                  (out/f'{name}{ext}').write_bytes(r.content)
-                  info['saved']=f'{name}{ext}'
-                  report.append(info); continue
-              text=r.text
-              (out/f'{name}.html').write_text(text,errors='ignore')
-              text2=html.unescape(text).replace('\\u0026','&').replace('\\/','/')
-              cand=[]
-              patterns=[r'https?://[^"\'<>\\\s]+',r'["\'](?:src|url|audioUrl|audio_url|audioSrc|audio_src)["\']\s*:\s*["\']([^"\']+)',r'(?:src|url)=["\']([^"\']+)["\']']
-              for pat in patterns:
-                  for m in re.finditer(pat,text2,re.I):
-                      u=m.group(1) if m.lastindex else m.group(0)
-                      u=u.replace('&amp;','&')
-                      if u.startswith('//'):u='https:'+u
-                      if u.startswith('http') and u not in cand:cand.append(u)
-              (out/f'{name}-urls.json').write_text(json.dumps(cand,indent=2))
-              for i,u in enumerate(cand):
-                  if not any(k in u.lower() for k in ['audio','mp3','m4a','wav','aac','cdn','media','soundbite','storage.googleapis']):continue
-                  try:
-                      rr=s.get(u,timeout=60,allow_redirects=True,headers={'Referer':r.url,'User-Agent':s.headers['User-Agent']})
-                      ct=(rr.headers.get('content-type') or '').lower()
-                      info['tries'].append({'i':i,'url':u,'final':rr.url,'status':rr.status_code,'ctype':ct,'length':len(rr.content)})
-                      if 'audio/' in ct or rr.url.split('?')[0].lower().endswith(('.mp3','.m4a','.wav','.aac')):
-                          ext='.m4a' if 'mp4' in ct else '.wav' if 'wav' in ct else '.aac' if 'aac' in ct else '.mp3'
-                          (out/f'{name}{ext}').write_bytes(rr.content)
-                          info['saved']=f'{name}{ext}'
+          rm -rf speechify_capture && mkdir speechify_capture
+          pulseaudio --kill || true
+          pulseaudio --daemonize=yes --exit-idle-time=-1 --log-target=file:/tmp/pulse.log
+          sleep 1
+          pactl load-module module-null-sink sink_name=SpeechSink sink_properties=device.description=SpeechSink
+          pactl set-default-sink SpeechSink
+          pactl set-default-source SpeechSink.monitor
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1280x960x24 >/tmp/xvfb.log 2>&1 &
+          sleep 2
+          cat > /tmp/capture.py <<'PY'
+          import subprocess, time, pathlib, traceback
+          from selenium import webdriver
+          from selenium.webdriver.chrome.options import Options
+          from selenium.webdriver.common.by import By
+          from selenium.webdriver.support.ui import WebDriverWait
+          from selenium.webdriver.support import expected_conditions as EC
+
+          out=pathlib.Path('speechify_capture')
+          items=[
+            ('wife1','https://app.speechify.com/soundbite/7f9e7eac6126477eae9ebc3257ab8fc5?utm_source=chatgpt_app&utm_medium=punchout'),
+            ('husband1','https://app.speechify.com/soundbite/9d14f4ce44d2488eb7d61dbbd072a653?utm_source=chatgpt_app&utm_medium=punchout'),
+            ('wife2','https://app.speechify.com/soundbite/43e4e808801c44c381163fdb1af31e2a?utm_source=chatgpt_app&utm_medium=punchout'),
+            ('husband2','https://app.speechify.com/soundbite/18ac239e4897431f8cb8709385aacf27?utm_source=chatgpt_app&utm_medium=punchout'),
+          ]
+
+          def new_driver():
+              opt=Options()
+              opt.add_argument('--no-sandbox')
+              opt.add_argument('--disable-dev-shm-usage')
+              opt.add_argument('--autoplay-policy=no-user-gesture-required')
+              opt.add_argument('--disable-gpu')
+              opt.add_argument('--window-size=1280,960')
+              opt.add_argument('--disable-background-networking')
+              return webdriver.Chrome(options=opt)
+
+          successes=[]
+          for name,url in items:
+              driver=None; rec=None
+              try:
+                  print('\nOPEN',name,url,flush=True)
+                  driver=new_driver()
+                  driver.get(url)
+                  time.sleep(8)
+                  raw=out/f'{name}-raw.wav'
+                  rec=subprocess.Popen(['parec','--device=SpeechSink.monitor','--file-format=wav','--rate=48000','--channels=2',str(raw)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                  time.sleep(.5)
+                  clicked=False
+                  wait=WebDriverWait(driver,18)
+                  selectors=["[data-testid='compact-player-listen-button']","[data-testid='player-play-button']"]
+                  for sel in selectors:
+                      try:
+                          btn=wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR,sel)))
+                          print('CLICK',sel,'text=',btn.text,flush=True)
+                          driver.execute_script('arguments[0].click()',btn)
+                          clicked=True
                           break
-                  except Exception as e:
-                      info['tries'].append({'i':i,'url':u,'error':str(e)})
-              report.append(info)
-          (out/'report.json').write_text(json.dumps(report,indent=2))
+                      except Exception as e:
+                          print('selector miss',sel,type(e).__name__,flush=True)
+                  if not clicked:
+                      for btn in driver.find_elements(By.TAG_NAME,'button'):
+                          text=((btn.text or '')+' '+(btn.get_attribute('aria-label') or '')).strip().lower()
+                          if 'listen' in text or 'play' in text:
+                              print('CLICK FALLBACK',text,flush=True)
+                              driver.execute_script('arguments[0].click()',btn)
+                              clicked=True; break
+                  if not clicked:
+                      (out/f'{name}-page.html').write_text(driver.page_source,errors='ignore')
+                      raise RuntimeError('No play button')
+                  time.sleep(7)
+                  rec.terminate()
+                  try: rec.wait(timeout=4)
+                  except: rec.kill()
+                  rec=None
+                  if not raw.exists() or raw.stat().st_size<1000:
+                      raise RuntimeError('No captured WAV')
+                  trimmed=out/f'{name}.wav'
+                  subprocess.run(['ffmpeg','-hide_banner','-loglevel','warning','-y','-i',str(raw),'-af',
+                    'silenceremove=start_periods=1:start_silence=0.04:start_threshold=-50dB:stop_periods=-1:stop_silence=0.12:stop_threshold=-50dB,alimiter=limit=0.95',
+                    '-ar','48000','-ac','2',str(trimmed)],check=True)
+                  dur=float(subprocess.check_output(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(trimmed)],text=True).strip())
+                  print('DONE',name,'duration',dur,'size',trimmed.stat().st_size,flush=True)
+                  if dur<0.15: raise RuntimeError('Trimmed audio too short')
+                  successes.append(name)
+              except Exception as e:
+                  print('FAILED',name,repr(e),flush=True)
+                  traceback.print_exc()
+              finally:
+                  if rec:
+                      try: rec.terminate(); rec.wait(timeout=2)
+                      except: pass
+                  if driver:
+                      try: driver.quit()
+                      except: pass
+                  time.sleep(2)
+          print('SUCCESSES',successes,flush=True)
+          if len(successes)<4:
+              print('WARNING: not all four captured',flush=True)
           PY
-          find speechify_bridge_out -maxdepth 1 -type f -printf '%f %s bytes\n'
+          python3 /tmp/capture.py
+          rm -f speechify_capture/*-raw.wav || true
+          ls -lh speechify_capture || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: speechify-audio
-          path: speechify_bridge_out/
-          if-no-files-found: error
+          name: speechify-captured-wav
+          path: speechify_capture/
+          if-no-files-found: warn

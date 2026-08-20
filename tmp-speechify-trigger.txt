@@ -1,0 +1,1 @@
+Temporary trigger for Speechify audio extraction. This file will be removed after the bridge run.
